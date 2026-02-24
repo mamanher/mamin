@@ -2,59 +2,113 @@ name: STABLE_FINAL
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "0 */6 * * *"
+    # Backup trigger setiap 5.5 jam kalau auto re-trigger gagal
+    - cron: "30 */5 * * *"
+
+# Cegah duplikat — hanya 1 instance jalan sekaligus
+concurrency:
+  group: rdp-session
+  cancel-in-progress: false
 
 jobs:
-  rdp-admin-pro:
+  rdp-session:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: 🔑 Credential Generation
-        id: user_gen
+      # ──────────────── SETUP ────────────────
+      - name: 🔑 Generate Credentials
+        id: creds
         run: |
-          $pass = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          $chars = ([char[]]('a'..'z') + [char[]]('A'..'Z') + [char[]]('0'..'9'))
+          $pass = -join (1..20 | ForEach-Object { $chars | Get-Random })
           echo "::add-mask::$pass"
           $secPass = ConvertTo-SecureString $pass -AsPlainText -Force
-          New-LocalUser -Name "Pro_Admin" -Password $secPass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "Pro_Admin"
+          New-LocalUser -Name "Pro_Admin" -Password $secPass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Set-LocalUser -Name "Pro_Admin" -Password $secPass
+          Add-LocalGroupMember -Group "Administrators" -Member "Pro_Admin" -ErrorAction SilentlyContinue
           echo "PASS=$pass" >> $env:GITHUB_OUTPUT
 
-      - name: 🌐 Tailscale Mesh Deployment
-        id: ts
+      - name: 🌐 Deploy Tailscale
+        id: network
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "ts.msi"
           Start-Process msiexec.exe -ArgumentList "/i", "ts.msi", "/quiet", "/norestart" -Wait
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=PRO-RDP-$(Get-Random)
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          echo "IP=$tsIP" >> $env:GITHUB_OUTPUT
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=PRO-RDP-$(Get-Random -Minimum 1000 -Maximum 9999)
+          $ip = & $ts ip -4
+          echo "IP=$ip" >> $env:GITHUB_OUTPUT
+          echo "::notice::Tailscale IP = $ip"
 
-      - name: 📤 Telegram (IP, User, Pass Only)
+      # ──────────────── NOTIFY ────────────────
+      - name: 📤 Send Telegram Notification
         run: |
-          # Pesan teks polos tanpa format Markdown agar tidak rewel
-          $msg = "💎 mamanher SESSION ACTIVE`n`n🚀 Host: ${{ steps.ts.outputs.IP }}`n👤 User: Pro_Admin`n🔑 Pass: ${{ steps.user_gen.outputs.PASS }}`n`n⚡ @TipsUNIX"
-          
-          $body = @{ 
-              chat_id = "${{ secrets.TELEGRAM_CHAT_ID }}"
-              text = $msg
-          } | ConvertTo-Json
-          
-          Invoke-RestMethod -Uri "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" -Method Post -Body $body -ContentType "application/json"
+          $uptime = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+          $msg = @"
+          💎 mamanher SESSION ACTIVE
 
-      - name: ⏳ Keep-Alive
+          🚀 Host: ${{ steps.network.outputs.IP }}
+          👤 User: Pro_Admin
+          🔑 Pass: ${{ steps.creds.outputs.PASS }}
+          🕐 Started: $uptime
+          ⏱️ Max Duration: ~5h 50m
+
+          ⚡ @TipsUNIX
+          "@
+
+          $body = @{
+            chat_id = "${{ secrets.TELEGRAM_CHAT_ID }}"
+            text    = $msg.Trim()
+          } | ConvertTo-Json -Depth 3
+
+          Invoke-RestMethod -Uri "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" `
+            -Method Post -Body $body -ContentType "application/json; charset=utf-8"
+
+      # ──────────────── KEEP ALIVE ────────────────
+      - name: ⏳ Keep-Alive (350 min)
         run: |
-          $start = Get-Date
-          while ($true) {
-            $diff = (Get-Date) - $start
-            if ($diff.TotalMinutes -ge 350) { break }
+          $end = (Get-Date).AddMinutes(350)
+          $i = 0
+          while ((Get-Date) -lt $end) {
+            $i++
+            $remaining = [math]::Round(($end - (Get-Date)).TotalMinutes)
+            if ($i % 30 -eq 0) {
+              Write-Host "🟢 Alive — $remaining min remaining"
+            }
             Start-Sleep -Seconds 60
           }
+          Write-Host "⏰ Session ending, preparing restart..."
 
-      - name: 🧹 Cleanup
+      # ──────────────── CLEANUP & RESTART ────────────────
+      - name: 🧹 Cleanup Tailscale
         if: always()
         run: |
-          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout }
+
+      - name: 🔄 Auto Re-trigger (24/7 loop)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Write-Host "♻️ Triggering next session..."
+          $headers = @{
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "Accept"        = "application/vnd.github+json"
+          }
+          $uri = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/home.yml/dispatches"
+          $body = '{"ref":"main"}'
+
+          # Retry 3x in case of transient failure
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -ContentType "application/json"
+              Write-Host "✅ Next session triggered (attempt $attempt)"
+              break
+            } catch {
+              Write-Host "⚠️ Attempt $attempt failed: $_"
+              Start-Sleep -Seconds 10
+            }
           }
